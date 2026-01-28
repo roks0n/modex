@@ -98,13 +98,63 @@ func buildModuleMap(srcRoot string) (map[string]string, error) {
 	return moduleMap, err
 }
 
+func buildModuleMapForRoots(srcRoot string) (map[string]string, []string) {
+	moduleMap := make(map[string]string)
+	errors := []string{}
+	roots := []string{}
+	if srcRoot != "" {
+		roots = append(roots, srcRoot)
+		srcDir := filepath.Join(srcRoot, "src")
+		if cleanRoot := filepath.Clean(srcRoot); filepath.Clean(srcDir) != cleanRoot {
+			if info, err := os.Stat(srcDir); err == nil && info.IsDir() {
+				roots = append(roots, srcDir)
+			}
+		}
+	}
+	for _, root := range roots {
+		m, err := buildModuleMap(root)
+		if err != nil {
+			errors = append(errors, err.Error())
+			continue
+		}
+		for k, v := range m {
+			moduleMap[k] = v
+		}
+	}
+	return moduleMap, errors
+}
+
 func buildPathToModuleMap(moduleMap map[string]string) map[string]string {
 	pathToModule := make(map[string]string, len(moduleMap))
 	for modulePath, filePath := range moduleMap {
 		cleanPath := filepath.Clean(filePath)
+		if existing, ok := pathToModule[cleanPath]; ok {
+			pathToModule[cleanPath] = preferModulePath(existing, modulePath)
+			continue
+		}
 		pathToModule[cleanPath] = modulePath
 	}
 	return pathToModule
+}
+
+func preferModulePath(current string, candidate string) string {
+	if current == "" {
+		return candidate
+	}
+	currentIsSrc := strings.HasPrefix(current, "src.")
+	candidateIsSrc := strings.HasPrefix(candidate, "src.")
+	if currentIsSrc != candidateIsSrc {
+		if candidateIsSrc {
+			return current
+		}
+		return candidate
+	}
+	currentParts := strings.Split(current, ".")
+	candidateParts := strings.Split(candidate, ".")
+	if len(candidateParts) < len(currentParts) {
+		return candidate
+	}
+	return current
 }
 
 func resolveEntrypointModule(moduleSpec string, srcRoot string, moduleMap map[string]string, pathToModule map[string]string) (string, bool) {
@@ -510,21 +560,51 @@ func analyzeFunctionCalls(functionNode *sitter.Node, source []byte) []CallTarget
 		case "attribute":
 			obj := fnNode.ChildByFieldName("object")
 			attr := fnNode.ChildByFieldName("attribute")
-			if obj != nil && attr != nil && obj.Type() == "identifier" && attr.Type() == "identifier" {
+			if obj == nil || attr == nil || attr.Type() != "identifier" {
+				return
+			}
+			if obj.Type() == "identifier" {
 				calls = append(calls, CallTarget{Kind: "attr", Base: nodeText(source, obj), Attr: nodeText(source, attr)})
+				return
+			}
+			if obj.Type() == "call" {
+				innerFn := obj.ChildByFieldName("function")
+				if innerFn == nil {
+					return
+				}
+				switch innerFn.Type() {
+				case "identifier":
+					calls = append(calls, CallTarget{Kind: "ctor", Base: nodeText(source, innerFn), Attr: nodeText(source, attr)})
+				case "attribute":
+					innerObj := innerFn.ChildByFieldName("object")
+					innerAttr := innerFn.ChildByFieldName("attribute")
+					if innerObj != nil && innerAttr != nil && innerObj.Type() == "identifier" && innerAttr.Type() == "identifier" {
+						calls = append(calls, CallTarget{Kind: "ctor_attr", Base: nodeText(source, innerObj), Attr: nodeText(source, innerAttr), Name: nodeText(source, attr)})
+					}
+				}
 			}
 		}
 	})
 	return calls
 }
 
-func resolveCallTarget(call CallTarget, moduleInfo *ModuleInfo, moduleMap map[string]string, currentClass string) (string, string, string, bool) {
+func resolveCallTarget(call CallTarget, moduleInfo *ModuleInfo, moduleMap map[string]string, currentClass string, getModuleInfo func(string) (*ModuleInfo, error)) (string, string, string, bool) {
 	if call.Kind == "name" && call.Name != "" {
 		if fn, ok := moduleInfo.Functions[call.Name]; ok && fn != nil {
 			return moduleInfo.ModulePath, "", call.Name, true
 		}
 		if target, ok := moduleInfo.FromImports[call.Name]; ok {
 			if _, ok := moduleMap[target.Module]; ok {
+				if getModuleInfo != nil {
+					if targetInfo, err := getModuleInfo(target.Module); err == nil && targetInfo != nil {
+						if fn, ok := targetInfo.Functions[target.Name]; ok && fn != nil {
+							return target.Module, "", target.Name, true
+						}
+						if _, ok := targetInfo.Classes[target.Name]; ok {
+							return "", "", "", false
+						}
+					}
+				}
 				return target.Module, "", target.Name, true
 			}
 		}
@@ -549,6 +629,29 @@ func resolveCallTarget(call CallTarget, moduleInfo *ModuleInfo, moduleMap map[st
 		if methods, ok := moduleInfo.Classes[call.Base]; ok {
 			if _, ok := methods[call.Attr]; ok {
 				return moduleInfo.ModulePath, call.Base, call.Attr, true
+			}
+		}
+	} else if call.Kind == "ctor" && call.Base != "" && call.Attr != "" {
+		if methods, ok := moduleInfo.Classes[call.Base]; ok {
+			if _, ok := methods[call.Attr]; ok {
+				return moduleInfo.ModulePath, call.Base, call.Attr, true
+			}
+		}
+		if target, ok := moduleInfo.FromImports[call.Base]; ok {
+			if _, ok := moduleMap[target.Module]; ok {
+				return target.Module, target.Name, call.Attr, true
+			}
+		}
+	} else if call.Kind == "ctor_attr" && call.Base != "" && call.Attr != "" && call.Name != "" {
+		if modulePath, ok := moduleInfo.ModuleImports[call.Base]; ok {
+			if _, ok := moduleMap[modulePath]; ok {
+				return modulePath, call.Attr, call.Name, true
+			}
+		}
+		if target, ok := moduleInfo.FromImports[call.Base]; ok {
+			modulePath := target.Module + "." + target.Name
+			if _, ok := moduleMap[modulePath]; ok {
+				return modulePath, call.Attr, call.Name, true
 			}
 		}
 	}
@@ -600,9 +703,9 @@ func getEntrySeeds(moduleInfo *ModuleInfo, entryObject string, entryClass string
 }
 
 func collectModelsForEntrypoint(entrypoint string, srcRoot string) (map[ModelRef]struct{}, map[ModelRef]map[string]struct{}, []string) {
-	moduleMap, err := buildModuleMap(srcRoot)
-	if err != nil {
-		return map[ModelRef]struct{}{}, map[ModelRef]map[string]struct{}{}, []string{err.Error()}
+	moduleMap, mapErrors := buildModuleMapForRoots(srcRoot)
+	if len(mapErrors) > 0 {
+		return map[ModelRef]struct{}{}, map[ModelRef]map[string]struct{}{}, mapErrors
 	}
 	pathToModule := buildPathToModuleMap(moduleMap)
 	moduleSpec := entrypoint
@@ -715,7 +818,7 @@ func collectModelsForEntrypoint(entrypoint string, srcRoot string) (map[ModelRef
 		}
 
 		for _, call := range analyzeFunctionCalls(funcNode, moduleInfo.Source) {
-			targetModule, targetClass, targetFunc, ok := resolveCallTarget(call, moduleInfo, moduleMap, className)
+			targetModule, targetClass, targetFunc, ok := resolveCallTarget(call, moduleInfo, moduleMap, className, getModuleInfo)
 			if !ok || targetFunc == "" {
 				continue
 			}
