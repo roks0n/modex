@@ -48,6 +48,9 @@ type ModuleInfo struct {
 }
 
 func getRoot() string {
+	if cwd, err := os.Getwd(); err == nil {
+		return filepath.Clean(cwd)
+	}
 	_, filename, _, ok := runtime.Caller(0)
 	if !ok {
 		return "."
@@ -93,6 +96,44 @@ func buildModuleMap(srcRoot string) (map[string]string, error) {
 		return nil
 	})
 	return moduleMap, err
+}
+
+func buildPathToModuleMap(moduleMap map[string]string) map[string]string {
+	pathToModule := make(map[string]string, len(moduleMap))
+	for modulePath, filePath := range moduleMap {
+		cleanPath := filepath.Clean(filePath)
+		pathToModule[cleanPath] = modulePath
+	}
+	return pathToModule
+}
+
+func resolveEntrypointModule(moduleSpec string, srcRoot string, moduleMap map[string]string, pathToModule map[string]string) (string, bool) {
+	if moduleSpec == "" {
+		return "", false
+	}
+	if _, ok := moduleMap[moduleSpec]; ok {
+		return moduleSpec, true
+	}
+	cleanSpec := filepath.Clean(moduleSpec)
+	candidates := []string{}
+	if filepath.IsAbs(cleanSpec) {
+		candidates = append(candidates, cleanSpec)
+	} else {
+		candidates = append(candidates, filepath.Clean(filepath.Join(srcRoot, cleanSpec)))
+		candidates = append(candidates, cleanSpec)
+	}
+	for _, candidate := range candidates {
+		if modulePath, ok := pathToModule[candidate]; ok {
+			return modulePath, true
+		}
+		if !strings.HasSuffix(candidate, ".py") {
+			pyCandidate := candidate + ".py"
+			if modulePath, ok := pathToModule[pyCandidate]; ok {
+				return modulePath, true
+			}
+		}
+	}
+	return "", false
 }
 
 func resolveRelativeImport(currentModule string, module string, level int, isPackage bool) string {
@@ -514,8 +555,25 @@ func resolveCallTarget(call CallTarget, moduleInfo *ModuleInfo, moduleMap map[st
 	return "", "", "", false
 }
 
-func getEntrySeeds(moduleInfo *ModuleInfo, entryObject string) [][3]string {
+func getEntrySeeds(moduleInfo *ModuleInfo, entryObject string, entryClass string, entryMethod string) [][3]string {
 	seeds := make([][3]string, 0)
+	if entryClass != "" {
+		if entryMethod != "" {
+			if methods, ok := moduleInfo.Classes[entryClass]; ok {
+				if _, ok := methods[entryMethod]; ok {
+					seeds = append(seeds, [3]string{moduleInfo.ModulePath, entryClass, entryMethod})
+				}
+			}
+			return seeds
+		}
+		if methods, ok := moduleInfo.Classes[entryClass]; ok {
+			for method := range methods {
+				seeds = append(seeds, [3]string{moduleInfo.ModulePath, entryClass, method})
+			}
+		}
+		return seeds
+	}
+
 	if entryObject == "" {
 		for fn := range moduleInfo.Functions {
 			seeds = append(seeds, [3]string{moduleInfo.ModulePath, "", fn})
@@ -546,15 +604,28 @@ func collectModelsForEntrypoint(entrypoint string, srcRoot string) (map[ModelRef
 	if err != nil {
 		return map[ModelRef]struct{}{}, map[ModelRef]map[string]struct{}{}, []string{err.Error()}
 	}
-	modulePath := entrypoint
+	pathToModule := buildPathToModuleMap(moduleMap)
+	moduleSpec := entrypoint
 	entryObject := ""
 	if strings.Contains(entrypoint, ":") {
 		parts := strings.SplitN(entrypoint, ":", 2)
-		modulePath = parts[0]
+		moduleSpec = parts[0]
 		entryObject = parts[1]
 	}
+	modulePath := moduleSpec
+	if resolved, ok := resolveEntrypointModule(moduleSpec, srcRoot, moduleMap, pathToModule); ok {
+		modulePath = resolved
+	}
 	if _, ok := moduleMap[modulePath]; !ok {
-		return map[ModelRef]struct{}{}, map[ModelRef]map[string]struct{}{}, []string{fmt.Sprintf("Module not found: %s", modulePath)}
+		return map[ModelRef]struct{}{}, map[ModelRef]map[string]struct{}{}, []string{fmt.Sprintf("Module not found: %s", moduleSpec)}
+	}
+	entryClass := ""
+	entryMethod := ""
+	if entryObject != "" && strings.Contains(entryObject, "::") {
+		parts := strings.SplitN(entryObject, "::", 2)
+		entryClass = parts[0]
+		entryMethod = parts[1]
+		entryObject = ""
 	}
 
 	moduleCache := map[string]*ModuleInfo{}
@@ -574,9 +645,20 @@ func collectModelsForEntrypoint(entrypoint string, srcRoot string) (map[ModelRef
 	if err != nil {
 		return map[ModelRef]struct{}{}, map[ModelRef]map[string]struct{}{}, []string{err.Error()}
 	}
-	seeds := getEntrySeeds(entryModule, entryObject)
+	seeds := getEntrySeeds(entryModule, entryObject, entryClass, entryMethod)
 	if len(seeds) == 0 {
-		return map[ModelRef]struct{}{}, map[ModelRef]map[string]struct{}{}, []string{fmt.Sprintf("Entrypoint object not found: %s in %s", entryObject, modulePath)}
+		entryLabel := entryObject
+		if entryClass != "" {
+			if entryMethod != "" {
+				entryLabel = entryClass + "::" + entryMethod
+			} else {
+				entryLabel = entryClass
+			}
+		}
+		if entryLabel == "" {
+			entryLabel = "(module)"
+		}
+		return map[ModelRef]struct{}{}, map[ModelRef]map[string]struct{}{}, []string{fmt.Sprintf("Entrypoint object not found: %s in %s", entryLabel, modulePath)}
 	}
 
 	models := map[ModelRef]struct{}{}
@@ -684,14 +766,14 @@ func walk(node *sitter.Node, fn func(*sitter.Node)) {
 }
 
 func main() {
-	entrypoint := flag.String("entrypoint", "", "Entrypoint like 'stars.accounting.pipeline.snapshots.pnl.alm_psm_usds:StarAlmPsmUsdsPnlSnapshotManager'")
+	entrypoint := flag.String("entrypoint", "", "Entrypoint like 'pkg.module:MyClass' or 'src/path/file.py:MyClass::method'")
 	rootFlag := flag.String("root", "", "Python source root (base directory containing package roots).")
 	explain := flag.Bool("explain", false, "Print where each model is used (module:function).")
 	flag.Usage = func() {
 		fmt.Fprintln(os.Stderr, "modex traces a Python entrypoint and lists referenced models from static analysis.")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Usage:")
-		fmt.Fprintln(os.Stderr, "  modex --entrypoint <module[:object]> [--root <path>] [--explain]")
+		fmt.Fprintln(os.Stderr, "  modex --entrypoint <module-or-path[:object]> [--root <path>] [--explain]")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Flags:")
 		flag.PrintDefaults()

@@ -51,14 +51,14 @@ Usage
 modex traces a Python entrypoint and lists referenced models from static analysis.
 
 ```
-modex --entrypoint <module[:object]> [--root <path>] [--explain]
+modex --entrypoint <module-or-path[:object]> [--root <path>] [--explain]
 ```
 
 Flags
 -----
 
-- `--entrypoint` (required): Python module path, optionally with a function or class name.
-  - Examples: `pkg.subpkg.module` or `pkg.subpkg.module:MyClass`
+- `--entrypoint` (required): Python module path or file path, optionally with a function or class name.
+  - Examples: `pkg.subpkg.module`, `pkg.subpkg.module:MyClass`, `src/pkg/subpkg/module.py:MyClass::method`
 - `--root` (optional): Filesystem root of your Python source tree. Defaults to the repository root.
 - `--explain` (optional): Show where each model is referenced (module:function).
 
@@ -75,6 +75,12 @@ List models referenced from a specific class or function:
 
 ```
 modex --entrypoint myapp.analytics.pipeline:MyPipeline
+```
+
+List models referenced from a specific class method using a file path:
+
+```
+modex --entrypoint src/myapp/analytics/pipeline.py:MyPipeline::run
 ```
 
 Include usage locations:
