@@ -44,6 +44,7 @@ type ModuleInfo struct {
 	FromImports   map[string]ImportFromTarget
 	Functions     map[string]*sitter.Node
 	Classes       map[string]map[string]*sitter.Node
+	ClassBases    map[string][]string
 	Source        []byte
 }
 
@@ -135,6 +136,94 @@ func buildPathToModuleMap(moduleMap map[string]string) map[string]string {
 		pathToModule[cleanPath] = modulePath
 	}
 	return pathToModule
+}
+
+func parseClassBases(classNode *sitter.Node, source []byte) []string {
+	if classNode == nil {
+		return nil
+	}
+	superNode := classNode.ChildByFieldName("superclasses")
+	if superNode == nil {
+		for i := 0; i < int(classNode.ChildCount()); i++ {
+			child := classNode.Child(i)
+			if child != nil && child.Type() == "argument_list" {
+				superNode = child
+				break
+			}
+		}
+	}
+	if superNode == nil {
+		return nil
+	}
+	bases := []string{}
+	seen := map[string]struct{}{}
+	walk(superNode, func(n *sitter.Node) {
+		switch n.Type() {
+		case "identifier", "attribute":
+			text := strings.TrimSpace(nodeText(source, n))
+			if text == "" {
+				return
+			}
+			if _, ok := seen[text]; ok {
+				return
+			}
+			seen[text] = struct{}{}
+			bases = append(bases, text)
+		}
+	})
+	return bases
+}
+
+func isNetworkModelBase(bases []string) bool {
+	for _, base := range bases {
+		if base == "NetworkModel" || base == "NetworkModal" || strings.HasSuffix(base, ".NetworkModel") || strings.HasSuffix(base, ".NetworkModal") {
+			return true
+		}
+	}
+	return false
+}
+
+func resolveModelBases(model ModelRef, moduleMap map[string]string, getModuleInfo func(string) (*ModuleInfo, error), visited map[ModelRef]struct{}) []string {
+	if model.Module == "" || model.Name == "" {
+		return nil
+	}
+	if _, ok := visited[model]; ok {
+		return nil
+	}
+	visited[model] = struct{}{}
+	if _, ok := moduleMap[model.Module]; !ok {
+		return nil
+	}
+	info, err := getModuleInfo(model.Module)
+	if err != nil || info == nil {
+		return nil
+	}
+	if bases, ok := info.ClassBases[model.Name]; ok && len(bases) > 0 {
+		return bases
+	}
+	if target, ok := info.FromImports[model.Name]; ok {
+		if _, ok := moduleMap[target.Module]; ok {
+			return resolveModelBases(ModelRef{Module: target.Module, Name: target.Name}, moduleMap, getModuleInfo, visited)
+		}
+	}
+	if info.IsPackage {
+		prefix := info.ModulePath + "."
+		candidates := make([]string, 0)
+		for modulePath := range moduleMap {
+			if strings.HasPrefix(modulePath, prefix) {
+				candidates = append(candidates, modulePath)
+			}
+		}
+		sort.Strings(candidates)
+		for _, modulePath := range candidates {
+			candidate := ModelRef{Module: modulePath, Name: model.Name}
+			bases := resolveModelBases(candidate, moduleMap, getModuleInfo, visited)
+			if len(bases) > 0 {
+				return bases
+			}
+		}
+	}
+	return nil
 }
 
 func preferModulePath(current string, candidate string) string {
@@ -246,6 +335,7 @@ func parseModule(modulePath string, filePath string) (*ModuleInfo, error) {
 		FromImports:   map[string]ImportFromTarget{},
 		Functions:     map[string]*sitter.Node{},
 		Classes:       map[string]map[string]*sitter.Node{},
+		ClassBases:    map[string][]string{},
 		Source:        content,
 	}
 
@@ -279,6 +369,9 @@ func collectDefinitions(info *ModuleInfo) {
 			if className != "" {
 				if _, ok := info.Classes[className]; !ok {
 					info.Classes[className] = map[string]*sitter.Node{}
+				}
+				if _, ok := info.ClassBases[className]; !ok {
+					info.ClassBases[className] = parseClassBases(node, info.Source)
 				}
 			}
 			for i := 0; i < int(node.ChildCount()); i++ {
@@ -702,10 +795,10 @@ func getEntrySeeds(moduleInfo *ModuleInfo, entryObject string, entryClass string
 	return seeds
 }
 
-func collectModelsForEntrypoint(entrypoint string, srcRoot string) (map[ModelRef]struct{}, map[ModelRef]map[string]struct{}, []string) {
+func collectModelsForEntrypoint(entrypoint string, srcRoot string) (map[ModelRef]struct{}, map[ModelRef]map[string]struct{}, map[ModelRef]bool, []string) {
 	moduleMap, mapErrors := buildModuleMapForRoots(srcRoot)
 	if len(mapErrors) > 0 {
-		return map[ModelRef]struct{}{}, map[ModelRef]map[string]struct{}{}, mapErrors
+		return map[ModelRef]struct{}{}, map[ModelRef]map[string]struct{}{}, map[ModelRef]bool{}, mapErrors
 	}
 	pathToModule := buildPathToModuleMap(moduleMap)
 	moduleSpec := entrypoint
@@ -720,7 +813,7 @@ func collectModelsForEntrypoint(entrypoint string, srcRoot string) (map[ModelRef
 		modulePath = resolved
 	}
 	if _, ok := moduleMap[modulePath]; !ok {
-		return map[ModelRef]struct{}{}, map[ModelRef]map[string]struct{}{}, []string{fmt.Sprintf("Module not found: %s", moduleSpec)}
+		return map[ModelRef]struct{}{}, map[ModelRef]map[string]struct{}{}, map[ModelRef]bool{}, []string{fmt.Sprintf("Module not found: %s", moduleSpec)}
 	}
 	entryClass := ""
 	entryMethod := ""
@@ -746,7 +839,7 @@ func collectModelsForEntrypoint(entrypoint string, srcRoot string) (map[ModelRef
 
 	entryModule, err := getModuleInfo(modulePath)
 	if err != nil {
-		return map[ModelRef]struct{}{}, map[ModelRef]map[string]struct{}{}, []string{err.Error()}
+		return map[ModelRef]struct{}{}, map[ModelRef]map[string]struct{}{}, map[ModelRef]bool{}, []string{err.Error()}
 	}
 	seeds := getEntrySeeds(entryModule, entryObject, entryClass, entryMethod)
 	if len(seeds) == 0 {
@@ -761,7 +854,7 @@ func collectModelsForEntrypoint(entrypoint string, srcRoot string) (map[ModelRef
 		if entryLabel == "" {
 			entryLabel = "(module)"
 		}
-		return map[ModelRef]struct{}{}, map[ModelRef]map[string]struct{}{}, []string{fmt.Sprintf("Entrypoint object not found: %s in %s", entryLabel, modulePath)}
+		return map[ModelRef]struct{}{}, map[ModelRef]map[string]struct{}{}, map[ModelRef]bool{}, []string{fmt.Sprintf("Entrypoint object not found: %s in %s", entryLabel, modulePath)}
 	}
 
 	models := map[ModelRef]struct{}{}
@@ -828,7 +921,15 @@ func collectModelsForEntrypoint(entrypoint string, srcRoot string) (map[ModelRef
 		}
 	}
 
-	return models, modelUsage, errors
+	modelBaseInfo := map[ModelRef]bool{}
+	for model := range models {
+		bases := resolveModelBases(model, moduleMap, getModuleInfo, map[ModelRef]struct{}{})
+		if isNetworkModelBase(bases) {
+			modelBaseInfo[model] = true
+		}
+	}
+
+	return models, modelUsage, modelBaseInfo, errors
 }
 
 func funcClassPrefix(className string) string {
@@ -897,7 +998,7 @@ func main() {
 	if root == "" {
 		root = getRoot()
 	}
-	models, modelUsage, errors := collectModelsForEntrypoint(*entrypoint, root)
+	models, modelUsage, modelBaseInfo, errors := collectModelsForEntrypoint(*entrypoint, root)
 	if len(errors) > 0 {
 		for _, err := range errors {
 			fmt.Printf("ERROR: %s\n", err)
@@ -917,8 +1018,12 @@ func main() {
 	})
 
 	for _, model := range modelList {
+		label := model.String()
+		if modelBaseInfo[model] {
+			label = label + " (NetworkModel)"
+		}
 		if *explain {
-			fmt.Println(model.String())
+			fmt.Println(label)
 			usageSet := modelUsage[model]
 			usageList := make([]string, 0, len(usageSet))
 			for item := range usageSet {
@@ -933,7 +1038,7 @@ func main() {
 				}
 			}
 		} else {
-			fmt.Println(model.String())
+			fmt.Println(label)
 		}
 	}
 }
