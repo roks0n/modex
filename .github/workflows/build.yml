@@ -19,12 +19,16 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.22'
+      - run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
 
-      - name: Build Linux binaries
+      - name: Build Linux amd64 binary
         run: |
           mkdir -p dist
-          GOARCH=amd64 go build -o dist/modex-linux-amd64
-          GOARCH=arm64 go build -o dist/modex-linux-arm64
+          CGO_ENABLED=1 GOARCH=amd64 go build -o dist/modex-linux-amd64
+
+      - name: Build Linux arm64 binary
+        run: |
+          CC=aarch64-linux-gnu-gcc CGO_ENABLED=1 GOARCH=arm64 go build -o dist/modex-linux-arm64
 
       - name: Upload Linux amd64 binary
         uses: actions/upload-artifact@v4
@@ -48,11 +52,14 @@ jobs:
         with:
           go-version: '1.22'
 
-      - name: Build macOS binaries
+      - name: Build macOS amd64 binary
         run: |
           mkdir -p dist
-          GOARCH=amd64 go build -o dist/modex-darwin-amd64
-          GOARCH=arm64 go build -o dist/modex-darwin-arm64
+          CGO_ENABLED=1 GOARCH=amd64 go build -o dist/modex-darwin-amd64
+
+      - name: Build macOS arm64 binary
+        run: |
+          CGO_ENABLED=1 GOARCH=arm64 go build -o dist/modex-darwin-arm64
 
       - name: Upload macOS amd64 binary
         uses: actions/upload-artifact@v4
