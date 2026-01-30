@@ -12,7 +12,7 @@ permissions:
   actions: write
 
 jobs:
-  build:
+  build-linux:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -20,14 +20,11 @@ jobs:
         with:
           go-version: '1.22'
 
-      - name: Delete old artifacts
-        uses: geekyeggo/delete-artifact@v5
-        with:
-          name: modex-*
-          failOnError: false
-
-      - name: Build binaries
-        run: make dist
+      - name: Build Linux binaries
+        run: |
+          mkdir -p dist
+          GOARCH=amd64 go build -o dist/modex-linux-amd64
+          GOARCH=arm64 go build -o dist/modex-linux-arm64
 
       - name: Upload Linux amd64 binary
         uses: actions/upload-artifact@v4
@@ -43,6 +40,20 @@ jobs:
           path: dist/modex-linux-arm64
           retention-days: 90
 
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Build macOS binaries
+        run: |
+          mkdir -p dist
+          GOARCH=amd64 go build -o dist/modex-darwin-amd64
+          GOARCH=arm64 go build -o dist/modex-darwin-arm64
+
       - name: Upload macOS amd64 binary
         uses: actions/upload-artifact@v4
         with:
@@ -57,8 +68,19 @@ jobs:
           path: dist/modex-darwin-arm64
           retention-days: 90
 
+  release:
+    needs: [build-linux, build-macos]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: modex-*
+          merge-multiple: true
+
       - name: Create Release
-        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
