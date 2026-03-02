@@ -35,6 +35,17 @@ type CallTarget struct {
 	Attr string
 }
 
+type CallResolution struct {
+	Module string
+	Class  string
+	Func   string
+}
+
+type ClassRef struct {
+	Module string
+	Name   string
+}
+
 type ModuleInfo struct {
 	ModulePath    string
 	FilePath      string
@@ -538,8 +549,8 @@ type usageInfo struct {
 	Attrs [][2]string
 }
 
-func analyzeFunctionModels(functionNode *sitter.Node, moduleInfo *ModuleInfo, moduleMap map[string]string) map[ModelRef]struct{} {
-	localModuleImports, localFromImports := collectImports(functionNode, moduleInfo, moduleInfo.Source)
+func collectScopedImports(node *sitter.Node, moduleInfo *ModuleInfo) (map[string]string, map[string]ImportFromTarget) {
+	localModuleImports, localFromImports := collectImports(node, moduleInfo, moduleInfo.Source)
 
 	moduleImports := map[string]string{}
 	for k, v := range moduleInfo.ModuleImports {
@@ -556,6 +567,12 @@ func analyzeFunctionModels(functionNode *sitter.Node, moduleInfo *ModuleInfo, mo
 	for k, v := range localFromImports {
 		fromImports[k] = v
 	}
+
+	return moduleImports, fromImports
+}
+
+func analyzeFunctionModels(functionNode *sitter.Node, moduleInfo *ModuleInfo, moduleMap map[string]string) map[ModelRef]struct{} {
+	moduleImports, fromImports := collectScopedImports(functionNode, moduleInfo)
 
 	usage := collectUsage(functionNode, moduleInfo.Source)
 	models := map[ModelRef]struct{}{}
@@ -591,6 +608,225 @@ func analyzeFunctionModels(functionNode *sitter.Node, moduleInfo *ModuleInfo, mo
 	}
 
 	return models
+}
+
+func collectLocalVariableTypes(functionNode *sitter.Node, moduleInfo *ModuleInfo, moduleMap map[string]string, getModuleInfo func(string) (*ModuleInfo, error)) map[string]map[ClassRef]struct{} {
+	moduleImports, fromImports := collectScopedImports(functionNode, moduleInfo)
+	localTypes := map[string]map[ClassRef]struct{}{}
+
+	var walkScoped func(node *sitter.Node)
+	walkScoped = func(node *sitter.Node) {
+		if node == nil {
+			return
+		}
+		if node != functionNode {
+			switch node.Type() {
+			case "function_definition", "class_definition", "lambda":
+				return
+			}
+		}
+		if isAssignmentNode(node) {
+			left, right := assignmentSides(node)
+			if left != nil && right != nil {
+				name := assignmentTargetName(left, moduleInfo.Source)
+				if name != "" {
+					if classRef, ok := resolveAssignedClass(right, moduleInfo, moduleImports, fromImports, moduleMap, getModuleInfo); ok {
+						addLocalType(localTypes, name, classRef)
+					}
+				}
+			}
+		}
+		for i := 0; i < int(node.ChildCount()); i++ {
+			child := node.Child(i)
+			walkScoped(child)
+		}
+	}
+
+	walkScoped(functionNode)
+	return localTypes
+}
+
+func addLocalType(localTypes map[string]map[ClassRef]struct{}, name string, classRef ClassRef) {
+	if name == "" || classRef.Module == "" || classRef.Name == "" {
+		return
+	}
+	if _, ok := localTypes[name]; !ok {
+		localTypes[name] = map[ClassRef]struct{}{}
+	}
+	localTypes[name][classRef] = struct{}{}
+}
+
+func isAssignmentNode(node *sitter.Node) bool {
+	if node == nil {
+		return false
+	}
+	switch node.Type() {
+	case "assignment", "assignment_statement", "annotated_assignment":
+		return true
+	}
+	return false
+}
+
+func assignmentSides(node *sitter.Node) (*sitter.Node, *sitter.Node) {
+	left := node.ChildByFieldName("left")
+	right := node.ChildByFieldName("right")
+	if left != nil && right != nil {
+		return left, right
+	}
+	for i := 0; i < int(node.ChildCount()); i++ {
+		child := node.Child(i)
+		if child != nil && child.Type() == "=" {
+			if i-1 >= 0 {
+				left = node.Child(i - 1)
+			}
+			if i+1 < int(node.ChildCount()) {
+				right = node.Child(i + 1)
+			}
+			break
+		}
+	}
+	if left != nil && right != nil {
+		return left, right
+	}
+	left = nil
+	right = nil
+	for i := 0; i < int(node.ChildCount()); i++ {
+		child := node.Child(i)
+		if child == nil || !child.IsNamed() {
+			continue
+		}
+		if left == nil {
+			left = child
+			continue
+		}
+		right = child
+	}
+	return left, right
+}
+
+func assignmentTargetName(node *sitter.Node, source []byte) string {
+	if node == nil {
+		return ""
+	}
+	switch node.Type() {
+	case "identifier", "attribute":
+		return nodeText(source, node)
+	}
+	return ""
+}
+
+func resolveAssignedClass(node *sitter.Node, moduleInfo *ModuleInfo, moduleImports map[string]string, fromImports map[string]ImportFromTarget, moduleMap map[string]string, getModuleInfo func(string) (*ModuleInfo, error)) (ClassRef, bool) {
+	callNode := unwrapCallNode(node)
+	if callNode == nil {
+		return ClassRef{}, false
+	}
+	fnNode := callNode.ChildByFieldName("function")
+	if fnNode == nil {
+		return ClassRef{}, false
+	}
+	switch fnNode.Type() {
+	case "identifier":
+		name := nodeText(moduleInfo.Source, fnNode)
+		return resolveClassIdentifier(name, moduleInfo, fromImports, moduleMap, getModuleInfo)
+	case "attribute":
+		obj := fnNode.ChildByFieldName("object")
+		attr := fnNode.ChildByFieldName("attribute")
+		if obj == nil || attr == nil || obj.Type() != "identifier" || attr.Type() != "identifier" {
+			return ClassRef{}, false
+		}
+		base := nodeText(moduleInfo.Source, obj)
+		attrName := nodeText(moduleInfo.Source, attr)
+		if modulePath, ok := moduleImports[base]; ok {
+			if classExists(modulePath, attrName, moduleInfo, moduleMap, getModuleInfo) {
+				return ClassRef{Module: modulePath, Name: attrName}, true
+			}
+		}
+		if target, ok := fromImports[base]; ok {
+			modulePath := target.Module + "." + target.Name
+			if _, ok := moduleMap[modulePath]; ok {
+				if classExists(modulePath, attrName, moduleInfo, moduleMap, getModuleInfo) {
+					return ClassRef{Module: modulePath, Name: attrName}, true
+				}
+			}
+		}
+		if attrName == "create" {
+			if classRef, ok := resolveClassIdentifier(base, moduleInfo, fromImports, moduleMap, getModuleInfo); ok {
+				return classRef, true
+			}
+		}
+	}
+	return ClassRef{}, false
+}
+
+func resolveClassIdentifier(name string, moduleInfo *ModuleInfo, fromImports map[string]ImportFromTarget, moduleMap map[string]string, getModuleInfo func(string) (*ModuleInfo, error)) (ClassRef, bool) {
+	if name == "" {
+		return ClassRef{}, false
+	}
+	if _, ok := moduleInfo.Classes[name]; ok {
+		return ClassRef{Module: moduleInfo.ModulePath, Name: name}, true
+	}
+	if target, ok := fromImports[name]; ok {
+		if !classExists(target.Module, target.Name, moduleInfo, moduleMap, getModuleInfo) {
+			return ClassRef{}, false
+		}
+		return ClassRef{Module: target.Module, Name: target.Name}, true
+	}
+	return ClassRef{}, false
+}
+
+func classExists(modulePath string, className string, moduleInfo *ModuleInfo, moduleMap map[string]string, getModuleInfo func(string) (*ModuleInfo, error)) bool {
+	if modulePath == "" || className == "" {
+		return false
+	}
+	if modulePath == moduleInfo.ModulePath {
+		if _, ok := moduleInfo.Classes[className]; ok {
+			return true
+		}
+	}
+	if _, ok := moduleMap[modulePath]; !ok {
+		return false
+	}
+	if getModuleInfo == nil {
+		return true
+	}
+	info, err := getModuleInfo(modulePath)
+	if err != nil || info == nil {
+		return false
+	}
+	if _, ok := info.Classes[className]; ok {
+		return true
+	}
+	return false
+}
+
+func unwrapCallNode(node *sitter.Node) *sitter.Node {
+	for node != nil {
+		if node.Type() == "call" {
+			return node
+		}
+		switch node.Type() {
+		case "await", "await_expression", "parenthesized_expression":
+			var next *sitter.Node
+			for i := 0; i < int(node.ChildCount()); i++ {
+				child := node.Child(i)
+				if child == nil || !child.IsNamed() {
+					continue
+				}
+				if next != nil {
+					next = nil
+					break
+				}
+				next = child
+			}
+			if next == nil {
+				return nil
+			}
+			node = next
+			continue
+		}
+		return nil
+	}
+	return nil
 }
 
 func collectUsage(functionNode *sitter.Node, source []byte) usageInfo {
@@ -660,6 +896,10 @@ func analyzeFunctionCalls(functionNode *sitter.Node, source []byte) []CallTarget
 				calls = append(calls, CallTarget{Kind: "attr", Base: nodeText(source, obj), Attr: nodeText(source, attr)})
 				return
 			}
+			if obj.Type() == "attribute" {
+				calls = append(calls, CallTarget{Kind: "attr", Base: nodeText(source, obj), Attr: nodeText(source, attr)})
+				return
+			}
 			if obj.Type() == "call" {
 				innerFn := obj.ChildByFieldName("function")
 				if innerFn == nil {
@@ -681,74 +921,120 @@ func analyzeFunctionCalls(functionNode *sitter.Node, source []byte) []CallTarget
 	return calls
 }
 
-func resolveCallTarget(call CallTarget, moduleInfo *ModuleInfo, moduleMap map[string]string, currentClass string, getModuleInfo func(string) (*ModuleInfo, error)) (string, string, string, bool) {
+func resolveCallTargets(call CallTarget, moduleInfo *ModuleInfo, moduleMap map[string]string, currentClass string, getModuleInfo func(string) (*ModuleInfo, error), localTypes map[string]map[ClassRef]struct{}) []CallResolution {
+	targets := []CallResolution{}
 	if call.Kind == "name" && call.Name != "" {
 		if fn, ok := moduleInfo.Functions[call.Name]; ok && fn != nil {
-			return moduleInfo.ModulePath, "", call.Name, true
+			return []CallResolution{{Module: moduleInfo.ModulePath, Func: call.Name}}
 		}
 		if target, ok := moduleInfo.FromImports[call.Name]; ok {
 			if _, ok := moduleMap[target.Module]; ok {
 				if getModuleInfo != nil {
 					if targetInfo, err := getModuleInfo(target.Module); err == nil && targetInfo != nil {
 						if fn, ok := targetInfo.Functions[target.Name]; ok && fn != nil {
-							return target.Module, "", target.Name, true
+							return []CallResolution{{Module: target.Module, Func: target.Name}}
 						}
 						if _, ok := targetInfo.Classes[target.Name]; ok {
-							return "", "", "", false
+							return targets
 						}
 					}
 				}
-				return target.Module, "", target.Name, true
+				return []CallResolution{{Module: target.Module, Func: target.Name}}
 			}
 		}
-	} else if call.Kind == "attr" && call.Base != "" && call.Attr != "" {
+		return targets
+	}
+
+	if call.Kind == "attr" && call.Base != "" && call.Attr != "" {
+		if refs, ok := localTypes[call.Base]; ok {
+			for classRef := range refs {
+				if classRef.Module == "" || classRef.Name == "" {
+					continue
+				}
+				if _, ok := moduleMap[classRef.Module]; !ok {
+					continue
+				}
+				if getModuleInfo != nil {
+					if targetInfo, err := getModuleInfo(classRef.Module); err == nil && targetInfo != nil {
+						if methods, ok := targetInfo.Classes[classRef.Name]; ok {
+							if _, ok := methods[call.Attr]; ok {
+								targets = append(targets, CallResolution{Module: classRef.Module, Class: classRef.Name, Func: call.Attr})
+							}
+						}
+					}
+				}
+			}
+		}
+		if target, ok := moduleInfo.FromImports[call.Base]; ok {
+			if classExists(target.Module, target.Name, moduleInfo, moduleMap, getModuleInfo) {
+				if getModuleInfo != nil {
+					if targetInfo, err := getModuleInfo(target.Module); err == nil && targetInfo != nil {
+						if methods, ok := targetInfo.Classes[target.Name]; ok {
+							if _, ok := methods[call.Attr]; ok {
+								targets = append(targets, CallResolution{Module: target.Module, Class: target.Name, Func: call.Attr})
+							}
+						}
+					}
+				} else {
+					targets = append(targets, CallResolution{Module: target.Module, Class: target.Name, Func: call.Attr})
+				}
+			}
+		}
 		if (call.Base == "self" || call.Base == "cls") && currentClass != "" {
 			methods := moduleInfo.Classes[currentClass]
 			if _, ok := methods[call.Attr]; ok {
-				return moduleInfo.ModulePath, currentClass, call.Attr, true
+				targets = append(targets, CallResolution{Module: moduleInfo.ModulePath, Class: currentClass, Func: call.Attr})
 			}
 		}
 		if modulePath, ok := moduleInfo.ModuleImports[call.Base]; ok {
 			if _, ok := moduleMap[modulePath]; ok {
-				return modulePath, "", call.Attr, true
+				targets = append(targets, CallResolution{Module: modulePath, Func: call.Attr})
 			}
 		}
 		if target, ok := moduleInfo.FromImports[call.Base]; ok {
 			modulePath := target.Module + "." + target.Name
 			if _, ok := moduleMap[modulePath]; ok {
-				return modulePath, "", call.Attr, true
+				targets = append(targets, CallResolution{Module: modulePath, Func: call.Attr})
 			}
 		}
 		if methods, ok := moduleInfo.Classes[call.Base]; ok {
 			if _, ok := methods[call.Attr]; ok {
-				return moduleInfo.ModulePath, call.Base, call.Attr, true
+				targets = append(targets, CallResolution{Module: moduleInfo.ModulePath, Class: call.Base, Func: call.Attr})
 			}
 		}
-	} else if call.Kind == "ctor" && call.Base != "" && call.Attr != "" {
+		return targets
+	}
+
+	if call.Kind == "ctor" && call.Base != "" && call.Attr != "" {
 		if methods, ok := moduleInfo.Classes[call.Base]; ok {
 			if _, ok := methods[call.Attr]; ok {
-				return moduleInfo.ModulePath, call.Base, call.Attr, true
+				return []CallResolution{{Module: moduleInfo.ModulePath, Class: call.Base, Func: call.Attr}}
 			}
 		}
 		if target, ok := moduleInfo.FromImports[call.Base]; ok {
 			if _, ok := moduleMap[target.Module]; ok {
-				return target.Module, target.Name, call.Attr, true
+				return []CallResolution{{Module: target.Module, Class: target.Name, Func: call.Attr}}
 			}
 		}
-	} else if call.Kind == "ctor_attr" && call.Base != "" && call.Attr != "" && call.Name != "" {
+		return targets
+	}
+
+	if call.Kind == "ctor_attr" && call.Base != "" && call.Attr != "" && call.Name != "" {
 		if modulePath, ok := moduleInfo.ModuleImports[call.Base]; ok {
 			if _, ok := moduleMap[modulePath]; ok {
-				return modulePath, call.Attr, call.Name, true
+				return []CallResolution{{Module: modulePath, Class: call.Attr, Func: call.Name}}
 			}
 		}
 		if target, ok := moduleInfo.FromImports[call.Base]; ok {
 			modulePath := target.Module + "." + target.Name
 			if _, ok := moduleMap[modulePath]; ok {
-				return modulePath, call.Attr, call.Name, true
+				return []CallResolution{{Module: modulePath, Class: call.Attr, Func: call.Name}}
 			}
 		}
+		return targets
 	}
-	return "", "", "", false
+
+	return targets
 }
 
 func getEntrySeeds(moduleInfo *ModuleInfo, entryObject string, entryClass string, entryMethod string) [][3]string {
@@ -910,13 +1196,16 @@ func collectModelsForEntrypoint(entrypoint string, srcRoot string) (map[ModelRef
 			modelUsage[model][usageKey] = struct{}{}
 		}
 
+		localTypes := collectLocalVariableTypes(funcNode, moduleInfo, moduleMap, getModuleInfo)
 		for _, call := range analyzeFunctionCalls(funcNode, moduleInfo.Source) {
-			targetModule, targetClass, targetFunc, ok := resolveCallTarget(call, moduleInfo, moduleMap, className, getModuleInfo)
-			if !ok || targetFunc == "" {
-				continue
-			}
-			if _, ok := moduleMap[targetModule]; ok {
-				queue = append(queue, [3]string{targetModule, targetClass, targetFunc})
+			targets := resolveCallTargets(call, moduleInfo, moduleMap, className, getModuleInfo, localTypes)
+			for _, target := range targets {
+				if target.Func == "" {
+					continue
+				}
+				if _, ok := moduleMap[target.Module]; ok {
+					queue = append(queue, [3]string{target.Module, target.Class, target.Func})
+				}
 			}
 		}
 	}
