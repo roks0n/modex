@@ -1012,7 +1012,7 @@ func resolveCallTargets(call CallTarget, moduleInfo *ModuleInfo, moduleMap map[s
 			}
 		}
 		if target, ok := moduleInfo.FromImports[call.Base]; ok {
-			if _, ok := moduleMap[target.Module]; ok {
+			if classExists(target.Module, target.Name, moduleInfo, moduleMap, getModuleInfo) {
 				return []CallResolution{{Module: target.Module, Class: target.Name, Func: call.Attr}}
 			}
 		}
@@ -1021,13 +1021,13 @@ func resolveCallTargets(call CallTarget, moduleInfo *ModuleInfo, moduleMap map[s
 
 	if call.Kind == "ctor_attr" && call.Base != "" && call.Attr != "" && call.Name != "" {
 		if modulePath, ok := moduleInfo.ModuleImports[call.Base]; ok {
-			if _, ok := moduleMap[modulePath]; ok {
+			if classExists(modulePath, call.Attr, moduleInfo, moduleMap, getModuleInfo) {
 				return []CallResolution{{Module: modulePath, Class: call.Attr, Func: call.Name}}
 			}
 		}
 		if target, ok := moduleInfo.FromImports[call.Base]; ok {
 			modulePath := target.Module + "." + target.Name
-			if _, ok := moduleMap[modulePath]; ok {
+			if classExists(modulePath, call.Attr, moduleInfo, moduleMap, getModuleInfo) {
 				return []CallResolution{{Module: modulePath, Class: call.Attr, Func: call.Name}}
 			}
 		}
